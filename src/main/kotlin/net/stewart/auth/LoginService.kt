@@ -39,6 +39,10 @@ class LoginService(
     /**
      * Attempts to authenticate a user by username and password.
      * Enforces rate limiting and records the attempt.
+     *
+     * @param ip The client's real IP address. **Must be resolved from trusted proxy headers only.**
+     *   Never pass a raw `X-Forwarded-For` value from an untrusted source — an attacker could
+     *   rotate IPs to bypass per-IP rate limiting.
      */
     fun login(username: String, password: String, ip: String): LoginResult {
         val rateLimitResult = checkRateLimit(ip, username)

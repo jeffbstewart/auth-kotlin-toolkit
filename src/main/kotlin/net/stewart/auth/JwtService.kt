@@ -11,7 +11,6 @@ import java.security.SecureRandom
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDateTime
-import java.util.UUID
 import javax.sql.DataSource
 
 /**
@@ -170,7 +169,7 @@ class JwtService(
     }
 
     private fun createRefreshToken(user: AuthUser, deviceName: String, familyId: String? = null): String {
-        val token = UUID.randomUUID().toString()
+        val token = SessionService.generateSecureToken()
         val now = LocalDateTime.now()
         enforceTokenCap(user.id)
 
@@ -179,7 +178,7 @@ class JwtService(
                 """INSERT INTO refresh_token (user_id, token_hash, family_id, device_name, created_at, expires_at, revoked)
                    VALUES (:uid, :hash, :fam, :dev, :now, :exp, FALSE)"""
             ).bind("uid", user.id).bind("hash", hashToken(token))
-                .bind("fam", familyId ?: UUID.randomUUID().toString())
+                .bind("fam", familyId ?: SessionService.generateSecureToken())
                 .bind("dev", deviceName.take(255))
                 .bind("now", now).bind("exp", now.plusDays(refreshTokenDays)).execute()
         }

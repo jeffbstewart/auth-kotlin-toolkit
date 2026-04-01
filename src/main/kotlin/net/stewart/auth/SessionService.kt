@@ -3,9 +3,9 @@ package net.stewart.auth
 import org.jdbi.v3.core.Jdbi
 import org.slf4j.LoggerFactory
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.time.Instant
 import java.time.LocalDateTime
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.sql.DataSource
 
@@ -64,7 +64,7 @@ class SessionService(
             log.info("AUDIT: Session created user='{}'", user.username)
         }
 
-        val token = UUID.randomUUID().toString()
+        val token = generateSecureToken()
         val tokenHash = hashToken(token)
         val now = LocalDateTime.now()
         jdbi.withHandle<Int, Exception> { handle ->
@@ -85,6 +85,11 @@ class SessionService(
         // Check cache
         val cached = tokenCache[hash]
         if (cached != null && now.epochSecond - cached.cachedAt.epochSecond < cacheTtlSeconds) {
+            // Reject locked users even from cache
+            if (cached.user.isLocked) {
+                tokenCache.remove(hash)
+                return null
+            }
             // Throttle last_used_at updates (every 5 minutes)
             if (now.epochSecond - cached.lastUsedUpdatedAt.epochSecond >= 300L) {
                 try {
@@ -165,8 +170,8 @@ class SessionService(
         if (deleted > 0) log.info("Cleaned up {} expired session tokens", deleted)
     }
 
-    /** Builds a Set-Cookie header value for the session cookie. */
-    fun buildCookieHeader(token: String, secure: Boolean): String {
+    /** Builds a Set-Cookie header value for the session cookie. Secure flag defaults to true. */
+    fun buildCookieHeader(token: String, secure: Boolean = true): String {
         val maxAge = (sessionDays * 24 * 60 * 60).toInt()
         return buildString {
             append("$cookieName=$token; Path=/; Max-Age=$maxAge; HttpOnly; SameSite=Lax")
@@ -185,6 +190,15 @@ class SessionService(
     fun clearCache() { tokenCache.clear() }
 
     companion object {
+        private val secureRandom = SecureRandom()
+
+        /** Generates a 256-bit cryptographically random token (hex-encoded). */
+        fun generateSecureToken(): String {
+            val bytes = ByteArray(32)
+            secureRandom.nextBytes(bytes)
+            return bytes.joinToString("") { "%02x".format(it) }
+        }
+
         fun hashToken(token: String): String {
             val digest = MessageDigest.getInstance("SHA-256")
             return digest.digest(token.toByteArray()).joinToString("") { "%02x".format(it) }

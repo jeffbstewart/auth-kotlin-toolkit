@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS refresh_token (
     id              BIGINT AUTO_INCREMENT PRIMARY KEY,
     user_id         BIGINT NOT NULL,
     token_hash      VARCHAR(64) NOT NULL,
-    family_id       VARCHAR(36) NOT NULL,
+    family_id       VARCHAR(64) NOT NULL,
     device_name     VARCHAR(255) NOT NULL DEFAULT '',
     created_at      TIMESTAMP NOT NULL,
     expires_at      TIMESTAMP NOT NULL,
