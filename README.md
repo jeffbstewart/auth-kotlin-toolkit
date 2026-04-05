@@ -1,6 +1,6 @@
 # auth-kotlin-toolkit
 
-A Kotlin authentication framework providing JWT tokens, cookie-based sessions, BCrypt password hashing, rate-limited login with exponential backoff, and account lockout. Designed for Kotlin web applications with no framework coupling — bring your own HTTP server and ORM.
+A Kotlin authentication framework providing JWT tokens, cookie-based sessions, BCrypt password hashing, rate-limited login with exponential backoff, account lockout, and WebAuthn/passkey support. Designed for Kotlin web applications with no framework coupling — bring your own HTTP server and ORM.
 
 ## Features
 
@@ -8,6 +8,7 @@ A Kotlin authentication framework providing JWT tokens, cookie-based sessions, B
 - **Cookie sessions** — SHA-256 hashed tokens, in-memory cache with configurable TTL, per-user session cap, automatic cleanup
 - **Login with rate limiting** — per-IP and per-username failure tracking, exponential backoff (30s to 15min), daily failure cap, automatic account lockout
 - **JWT authentication** — HMAC-SHA256 access tokens (15min default) with refresh token rotation, family-based theft detection, dual-key rotation support
+- **WebAuthn / passkeys** — Face ID, Touch ID, and hardware security key authentication via stateless HMAC-signed challenges, credential CRUD, configurable relying party (domain + origin for non-standard ports)
 - **No framework coupling** — works with Armeria, Ktor, Spring, or raw servlets. You implement `UserRepository` to bridge to your data layer.
 
 ## Quick Start
@@ -36,7 +37,11 @@ cd auth-kotlin-toolkit && ./gradlew publishToMavenLocal
 
 ### 2. Create the auth tables
 
-Apply the migration in `src/main/resources/db/auth/V001__auth_tables.sql` to your database. If using Flyway, add `classpath:db/auth` to your migration locations.
+Apply the migrations in `src/main/resources/db/auth/` to your database:
+- `V001__auth_tables.sql` — session tokens, login attempts, refresh tokens, auth config
+- `V002__passkey_credential.sql` — WebAuthn passkey credentials (skip if not using passkeys)
+
+If using Flyway, add `classpath:db/auth` to your migration locations.
 
 ### 3. Implement the user interface
 
@@ -90,6 +95,18 @@ val jwt = JwtService(
     issuer = "myapp",
     audience = "myapp-api",
 )
+
+// WebAuthn / passkeys (optional)
+val webauthn = WebAuthnService(
+    dataSource = dataSource,
+    userRepository = userRepo,
+    signingKeyProvider = { jwt.signingKeyBytes() },
+    config = WebAuthnConfig(
+        rpId = "myapp.example.com",              // domain users access the site from
+        rpOrigin = "https://myapp.example.com",   // full origin (include port if non-standard)
+        rpName = "My Application",                // shown in browser passkey dialog
+    ),
+)
 ```
 
 ### 5. Use in your HTTP handlers
@@ -129,6 +146,61 @@ fun handleJwtLogin(username: String, password: String, ip: String, deviceName: S
 }
 ```
 
+### 6. Use WebAuthn in your HTTP handlers (optional)
+
+```kotlin
+// Passkey registration (authenticated user, from profile page)
+fun handleRegistrationOptions(userId: Long): Response {
+    val user = userRepo.findById(userId)!!
+    val opts = webauthn.generateRegistrationOptions(userId, user.username, user.username)
+    return Response(200, body = json(mapOf("challenge" to opts.signedChallenge, "options" to opts.optionsJson)))
+}
+
+fun handleRegistrationVerify(userId: Long, body: Map<String, Any>): Response {
+    val result = webauthn.verifyRegistration(
+        signedChallenge = body["challenge"] as String,
+        credentialId = (body["credential"] as Map<*, *>)["id"] as String,
+        clientDataJSON = ((body["credential"] as Map<*, *>)["response"] as Map<*, *>)["clientDataJSON"] as String,
+        attestationObject = ((body["credential"] as Map<*, *>)["response"] as Map<*, *>)["attestationObject"] as String,
+        transports = null,
+        displayName = body["display_name"] as? String ?: "Passkey",
+        userId = userId,
+    )
+    return when (result) {
+        is WebAuthnRegisterResult.Success -> Response(200, body = """{"ok":true}""")
+        is WebAuthnRegisterResult.Failed -> Response(400, body = """{"error":"${result.reason}"}""")
+    }
+}
+
+// Passkey authentication (unauthenticated, from login page)
+fun handleAuthenticationOptions(): Response {
+    val opts = webauthn.generateAuthenticationOptions()
+    return Response(200, body = json(mapOf("challenge" to opts.signedChallenge, "options" to opts.optionsJson)))
+}
+
+fun handleAuthenticationVerify(body: Map<String, Any>): Response {
+    val credential = body["credential"] as Map<*, *>
+    val response = credential["response"] as Map<*, *>
+    val result = webauthn.verifyAuthentication(
+        signedChallenge = body["challenge"] as String,
+        credentialId = credential["id"] as String,
+        clientDataJSON = response["clientDataJSON"] as String,
+        authenticatorData = response["authenticatorData"] as String,
+        signature = response["signature"] as String,
+        userHandle = response["userHandle"] as? String,
+    )
+    return when (result) {
+        is WebAuthnAuthResult.Success -> {
+            val pair = jwt.createTokenPair(result.user, "web-passkey")
+            Response(200, body = """{"access_token":"${pair.accessToken}","expires_in":${pair.expiresIn}}""")
+        }
+        is WebAuthnAuthResult.Failed -> Response(401, body = """{"error":"Authentication failed"}""")
+    }
+}
+```
+
+**Important:** The WebAuthn JSON spec nests `clientDataJSON`, `attestationObject`, `authenticatorData`, and `signature` under a `response` sub-object within the credential. Your HTTP handler must extract them from `credential.response`, not directly from `credential`.
+
 ## Configuration Reference
 
 ### SessionService
@@ -161,6 +233,18 @@ fun handleJwtLogin(username: String, password: String, ip: String, deviceName: S
 | `refreshTokenDays` | `30` | Refresh token lifetime |
 | `configTableName` | `"auth_config"` | Table for signing key storage |
 | `maxRefreshTokensPerUser` | `10` | Cap on active refresh tokens |
+
+### WebAuthnService
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `config.rpId` | *(required)* | Relying party domain (e.g., `mm.example.com`) |
+| `config.rpOrigin` | `null` | Full origin with protocol and port (e.g., `https://mm.example.com:8443`). If null, defaults to `https://{rpId}` or `http://localhost:4200` for localhost |
+| `config.rpName` | `"Application"` | Display name in browser passkey dialog |
+| `signingKeyProvider` | *(required)* | Lambda returning HMAC key bytes (typically `{ jwt.signingKeyBytes() }`) |
+| `challengeTtlSeconds` | `300` | Challenge validity window (5 minutes) |
+
+**Note on non-standard ports:** WebAuthn's RP ID is domain-only (no port), but the origin check during verification must include the port. If your site runs on a non-standard HTTPS port (e.g., `https://example.com:8443`), you must set `rpOrigin` explicitly.
 
 ## Periodic Maintenance
 

@@ -150,6 +150,9 @@ class JwtService(
         }
     }
 
+    /** Returns the raw HMAC signing key bytes. Used by [WebAuthnService] for challenge HMAC. */
+    fun signingKeyBytes(): ByteArray = hexToBytes(getOrCreateSigningKey())
+
     /** SHA-256 fingerprint of the signing key (for TOFU verification). */
     fun signingKeyFingerprint(): String {
         val key = getOrCreateSigningKey()

@@ -23,6 +23,9 @@ dependencies {
     // Database access (JDBI for direct SQL — no ORM opinion imposed)
     api("org.jdbi:jdbi3-core:3.49.4")
 
+    // WebAuthn / passkey support (optional — only needed if using WebAuthnService)
+    api("com.webauthn4j:webauthn4j-core:0.28.4.RELEASE")
+
     testImplementation(kotlin("test"))
     testImplementation("org.slf4j:slf4j-simple:2.0.17")
     testImplementation("com.h2database:h2:2.4.240")
