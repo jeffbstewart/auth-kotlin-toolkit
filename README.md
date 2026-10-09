@@ -4,11 +4,11 @@ A Kotlin authentication framework providing JWT tokens, cookie-based sessions, B
 
 ## Features
 
-- **Password hashing** — BCrypt with cost factor 12, timing-safe verification, dummy verify for account enumeration prevention
+- **Password hashing** — BCrypt with cost factor 12, timing-safe verification, dummy verify for account enumeration prevention; passwords capped at 72 UTF-8 bytes (BCrypt's input limit) so no input is silently truncated
 - **Cookie sessions** — SHA-256 hashed tokens, in-memory cache with configurable TTL, per-user session cap, automatic cleanup
-- **Login with rate limiting** — per-IP and per-username failure tracking, exponential backoff (30s to 15min), daily failure cap, automatic account lockout
-- **JWT authentication** — HMAC-SHA256 access tokens (15min default) with refresh token rotation, family-based theft detection, dual-key rotation support
-- **WebAuthn / passkeys** — Face ID, Touch ID, and hardware security key authentication via stateless HMAC-signed challenges, credential CRUD, configurable relying party (domain + origin for non-standard ports)
+- **Login with rate limiting** — atomic check-and-reserve per attempt, independent per-IP and per-username exponential backoff (30s to 15min), daily per-IP failure cap, temporary per-username lockout
+- **JWT authentication** — HMAC-SHA256 access tokens (15min default) with refresh token rotation (idempotent retries within a 60s grace window), family-based theft detection, dual-key rotation support
+- **WebAuthn / passkeys** — Face ID, Touch ID, and hardware security key authentication via HMAC-signed, single-use challenges, credential CRUD, configurable relying party (domain + origin for non-standard ports)
 - **No framework coupling** — works with Armeria, Ktor, Spring, or raw servlets. You implement `UserRepository` to bridge to your data layer.
 
 ## Quick Start
@@ -40,6 +40,7 @@ cd auth-kotlin-toolkit && ./gradlew publishToMavenLocal
 Apply the migrations in `src/main/resources/db/auth/` to your database:
 - `V001__auth_tables.sql` — session tokens, login attempts, refresh tokens, auth config
 - `V002__passkey_credential.sql` — WebAuthn passkey credentials (skip if not using passkeys)
+- `V003__webauthn_consumed_challenge.sql` — single-use challenge tracking for `JdbcConsumedChallengeStore` (only needed when several server processes share one database)
 
 If using Flyway, add `classpath:db/auth` to your migration locations.
 
@@ -220,8 +221,11 @@ fun handleAuthenticationVerify(body: Map<String, Any>): Response {
 | `rateLimitThreshold` | `5` | Failures before backoff starts |
 | `baseCooldownSeconds` | `30` | Initial backoff duration |
 | `maxCooldownSeconds` | `900` | Maximum backoff (15 minutes) |
-| `lockoutThreshold` | `20` | Failures before account lock |
-| `dailyFailureCap` | `100` | Hard daily limit per IP/username |
+| `lockoutThreshold` | `20` | Per-username failures (since last success, within `lockoutWindow`) before a temporary lockout |
+| `lockoutWindow` | `24h` | Window for counting lockout failures |
+| `lockoutDuration` | `30m` | How long a username is refused after its most recent failure once locked out |
+| `dailyFailureCap` | `100` | Hard daily limit per IP |
+| `clock` | system clock | Time source (for tests) |
 
 ### JwtService
 
@@ -233,6 +237,7 @@ fun handleAuthenticationVerify(body: Map<String, Any>): Response {
 | `refreshTokenDays` | `30` | Refresh token lifetime |
 | `configTableName` | `"auth_config"` | Table for signing key storage |
 | `maxRefreshTokensPerUser` | `10` | Cap on active refresh tokens |
+| `clock` | system clock | Time source (for tests) |
 
 ### WebAuthnService
 
@@ -243,6 +248,8 @@ fun handleAuthenticationVerify(body: Map<String, Any>): Response {
 | `config.rpName` | `"Application"` | Display name in browser passkey dialog |
 | `signingKeyProvider` | *(required)* | Lambda returning HMAC key bytes (typically `{ jwt.signingKeyBytes() }`) |
 | `challengeTtlSeconds` | `300` | Challenge validity window (5 minutes) |
+| `consumedChallengeStore` | in-memory | Records used challenges so each is single-use. Pass `JdbcConsumedChallengeStore(dataSource)` when several server processes serve one origin |
+| `clock` | system clock | Time source (for tests) |
 
 **Note on non-standard ports:** WebAuthn's RP ID is domain-only (no port), but the origin check during verification must include the port. If your site runs on a non-standard HTTPS port (e.g., `https://example.com:8443`), you must set `rpOrigin` explicitly.
 

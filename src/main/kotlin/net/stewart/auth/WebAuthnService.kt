@@ -14,6 +14,7 @@ import com.webauthn4j.verifier.exception.VerificationException
 import org.jdbi.v3.core.Jdbi
 import org.slf4j.LoggerFactory
 import java.security.SecureRandom
+import java.time.Clock
 import java.time.Instant
 import java.time.LocalDateTime
 import java.util.Base64
@@ -84,7 +85,9 @@ data class AuthenticationOptionsResponse(
  *
  * Challenges are stateless: a random challenge + metadata is HMAC-signed with the
  * signing key and returned to the client as an opaque token. On verification, the
- * server validates the HMAC and checks the 5-minute TTL.
+ * server validates the HMAC and checks the 5-minute TTL. Each challenge is single-use:
+ * the first verification attempt records it in a [ConsumedChallengeStore] until it
+ * expires, and any later attempt with the same challenge is rejected.
  *
  * Framework-agnostic: takes config as a data class, uses JDBI for database access.
  * Consumers are responsible for wiring this into their HTTP framework.
@@ -94,6 +97,10 @@ data class AuthenticationOptionsResponse(
  * @param signingKeyProvider Returns the raw HMAC signing key bytes (typically from [JwtService])
  * @param config Relying party configuration (domain, origin, display name)
  * @param challengeTtlSeconds How long a challenge is valid (default: 300 = 5 minutes)
+ * @param clock Time source (injectable for tests)
+ * @param consumedChallengeStore Records used challenges. The in-memory default is correct
+ *   for a single server process; deployments with several processes behind one origin
+ *   should pass a shared store such as [JdbcConsumedChallengeStore].
  */
 class WebAuthnService(
     private val dataSource: DataSource,
@@ -101,6 +108,8 @@ class WebAuthnService(
     private val signingKeyProvider: () -> ByteArray,
     private val config: WebAuthnConfig,
     private val challengeTtlSeconds: Int = 300,
+    private val clock: Clock = Clock.systemDefaultZone(),
+    private val consumedChallengeStore: ConsumedChallengeStore = InMemoryConsumedChallengeStore(clock),
 ) {
     private val log = LoggerFactory.getLogger(WebAuthnService::class.java)
     private val jdbi = Jdbi.create(dataSource)
@@ -214,7 +223,7 @@ class WebAuthnService(
         val publicKeyBytes = attestedCredentialDataConverter.convert(attestedData)
         val signCount = registrationData.attestationObject!!.authenticatorData.signCount
         val safeName = displayName.take(255).ifBlank { "Passkey" }
-        val now = LocalDateTime.now()
+        val now = LocalDateTime.now(clock)
 
         val id = jdbi.withHandle<Long, Exception> { handle ->
             handle.createUpdate(
@@ -340,7 +349,7 @@ class WebAuthnService(
         jdbi.withHandle<Int, Exception> { handle ->
             handle.createUpdate(
                 "UPDATE passkey_credential SET sign_count = :sc, last_used_at = :now WHERE id = :id"
-            ).bind("sc", newSignCount).bind("now", LocalDateTime.now()).bind("id", stored.id).execute()
+            ).bind("sc", newSignCount).bind("now", LocalDateTime.now(clock)).bind("id", stored.id).execute()
         }
 
         val user = userRepository.findById(stored.userId)
@@ -431,7 +440,7 @@ class WebAuthnService(
         // Simple format: challenge|timestamp|purpose[|userId]
         val parts = mutableListOf(
             base64UrlEncode(challenge),
-            Instant.now().epochSecond.toString(),
+            clock.instant().epochSecond.toString(),
             purpose,
         )
         userId?.let { parts.add(it.toString()) }
@@ -458,13 +467,20 @@ class WebAuthnService(
         if (parts.size < 3) throw IllegalArgumentException("Invalid challenge payload")
 
         val timestamp = parts[1].toLongOrNull() ?: throw IllegalArgumentException("Invalid timestamp")
-        val elapsed = Instant.now().epochSecond - timestamp
+        val elapsed = clock.instant().epochSecond - timestamp
         if (elapsed < 0 || elapsed > challengeTtlSeconds) {
             throw IllegalArgumentException("Challenge expired")
         }
 
         if (parts[2] != purpose) {
             throw IllegalArgumentException("Challenge purpose mismatch")
+        }
+
+        // Single use: the first verification attempt consumes the challenge, whatever its outcome.
+        val expiresAt = Instant.ofEpochSecond(timestamp).plusSeconds(challengeTtlSeconds.toLong())
+        if (!consumedChallengeStore.markConsumed("$purpose|${parts[0]}", expiresAt)) {
+            log.warn("AUDIT: WebAuthn {} challenge replay rejected", purpose)
+            throw IllegalArgumentException("Challenge already used")
         }
 
         return ChallengePayload(
